@@ -1,11 +1,11 @@
 """
-app.py — 롯데 석주 주간 골프 MD 뉴스 알림 (Claude 안정화 버전)
+app.py — 롯데 석주 주간 골프 MD 뉴스 알림 (Gemini 무료 운용 버전)
 
 실행 전 준비:
-  pip install streamlit anthropic openpyxl requests beautifulsoup4 pandas
-  export ANTHROPIC_API_KEY="sk-ant-..."
+  pip install streamlit google-genai openpyxl requests beautifulsoup4 pandas
+  export GEMINI_API_KEY="AIza..."
   # 선택:
-  # export ANTHROPIC_MODEL="claude-opus-4-6"
+  # export GEMINI_MODEL="gemini-2.5-flash"
   streamlit run app.py
 """
 
@@ -17,11 +17,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import anthropic
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from google import genai
 
 # ══════════════════════════════════════════════════════════════
 # 설정
@@ -33,8 +33,7 @@ st.set_page_config(
     layout="wide",
 )
 
-# 모델명은 환경변수로 바꿀 수 있게 두고, 기본값은 원본 유지
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 NEWS_FILE = Path("weekly_news.json")
 STORE_FILE = Path("store_profiles.xlsx")
@@ -67,13 +66,13 @@ CRAWL_QUERIES = [
 # ══════════════════════════════════════════════════════════════
 
 def get_api_key() -> str | None:
-    """환경변수 또는 Streamlit secrets 에서 Anthropic API 키 조회."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    """환경변수 또는 Streamlit secrets 에서 Gemini API 키 조회."""
+    api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         return api_key
 
     try:
-        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+        api_key = st.secrets.get("GEMINI_API_KEY")
         if api_key:
             return api_key
     except Exception:
@@ -87,16 +86,16 @@ def ensure_api_config():
     api_key = get_api_key()
     if not api_key:
         st.error(
-            "Anthropic API 키가 설정되지 않았습니다.\n\n"
+            "Gemini API 키가 설정되지 않았습니다.\n\n"
             "로컬 실행:\n"
             "```bash\n"
-            "export ANTHROPIC_API_KEY='sk-ant-...'\n"
+            "export GEMINI_API_KEY='AIza...'\n"
             "streamlit run app.py\n"
             "```\n\n"
             "Streamlit Cloud:\n"
             "`Settings > Secrets`에 아래를 추가하세요.\n"
             "```toml\n"
-            "ANTHROPIC_API_KEY = 'sk-ant-...'\n"
+            "GEMINI_API_KEY = 'AIza...'\n"
             "```"
         )
         st.stop()
@@ -133,20 +132,47 @@ def safe_str(value: Any, default: str = "") -> str:
 def get_client():
     api_key = get_api_key()
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY가 설정되지 않았습니다.")
-    return anthropic.Anthropic(api_key=api_key)
+        raise RuntimeError("GEMINI_API_KEY가 설정되지 않았습니다.")
+    return genai.Client(api_key=api_key)
+
+
+def _extract_text_from_response(response) -> str:
+    """Gemini 응답에서 텍스트를 최대한 안전하게 추출."""
+    # 가장 쉬운 경로
+    text = getattr(response, "text", None)
+    if text:
+        return text.strip()
+
+    # 후보 파싱 시도
+    candidates = getattr(response, "candidates", None)
+    if not candidates:
+        raise ValueError("Gemini 응답에서 candidates를 찾을 수 없습니다.")
+
+    parts_text = []
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                parts_text.append(part_text)
+
+    text = "\n".join(parts_text).strip()
+    if not text:
+        raise ValueError("Gemini 응답에서 텍스트를 찾을 수 없습니다.")
+    return text
 
 
 def _parse_json(text: str):
-    """Claude 응답에서 JSON만 최대한 안전하게 추출."""
+    """모델 응답에서 JSON만 최대한 안전하게 추출."""
     text = text.strip()
 
-    # ```json ... ``` 블록 추출
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     if fence_match:
         text = fence_match.group(1).strip()
 
-    # 맨 앞이 JSON이 아니면 객체/배열 부분만 추출 시도
     if not (text.startswith("{") or text.startswith("[")):
         obj_match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
         if obj_match:
@@ -155,29 +181,22 @@ def _parse_json(text: str):
     return json.loads(text)
 
 
-def ask_claude_json(prompt: str, max_tokens: int = 1024):
-    """Claude에 프롬프트를 보내 JSON 응답을 파싱해서 반환."""
+def ask_gemini_json(prompt: str):
+    """Gemini에 프롬프트를 보내 JSON 응답을 파싱해서 반환."""
     client = get_client()
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
+
+    strict_prompt = (
+        prompt
+        + "\n\n중요: 설명, 서론, 코드블록 없이 JSON만 반환하세요."
     )
 
-    # content가 비어 있거나 text 블록이 아닐 경우 방어
-    if not resp.content:
-        raise ValueError("Claude 응답이 비어 있습니다.")
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=strict_prompt,
+    )
 
-    parts = []
-    for block in resp.content:
-        block_text = getattr(block, "text", None)
-        if block_text:
-            parts.append(block_text)
-
-    if not parts:
-        raise ValueError("Claude 응답에서 텍스트를 찾을 수 없습니다.")
-
-    return _parse_json("\n".join(parts))
+    text = _extract_text_from_response(response)
+    return _parse_json(text)
 
 
 def show_ai_error(feature_name: str, err: Exception):
@@ -228,7 +247,6 @@ def load_store_profiles() -> list[dict]:
                         "trait": safe_str(row.get("점포특성", "")),
                     }
                 )
-            # 이름 비어있는 행 제거
             stores = [s for s in stores if s["name"]]
             if stores:
                 return stores
@@ -310,7 +328,7 @@ def crawl_all_news() -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════
-# Claude API
+# Gemini API
 # ══════════════════════════════════════════════════════════════
 
 def analyze_news_card(title: str, raw_text: str, category: str) -> dict:
@@ -334,7 +352,7 @@ def analyze_news_card(title: str, raw_text: str, category: str) -> dict:
 
 priority 기준: HIGH=즉각 매출·발주 영향 / MID=중기 영향 / LOW=참고용"""
 
-    result = ask_claude_json(prompt, max_tokens=1024)
+    result = ask_gemini_json(prompt)
     if not isinstance(result, dict):
         raise ValueError("뉴스 분석 응답 형식이 올바르지 않습니다.")
     return result
@@ -369,7 +387,7 @@ def classify_and_analyze_crawled(items: list[dict]) -> list[dict]:
   }}
 ]"""
 
-    result = ask_claude_json(prompt, max_tokens=3000)
+    result = ask_gemini_json(prompt)
     if not isinstance(result, list):
         raise ValueError("뉴스 일괄 분석 응답 형식이 올바르지 않습니다.")
     return result
@@ -408,7 +426,7 @@ def generate_store_insight(store: dict, news_items: list) -> list:
 
 작성 원칙: 점포 특성 반영 / 뉴스 → 실행 연결 / 실현 가능한 백화점 MD 행사 수준"""
 
-    results = ask_claude_json(prompt, max_tokens=1500)
+    results = ask_gemini_json(prompt)
     if not isinstance(results, list):
         raise ValueError("점포 인사이트 응답 형식이 올바르지 않습니다.")
 
@@ -436,7 +454,7 @@ def extract_weekly_keywords(all_news: list) -> list:
 
 count: 1~5 정수 / trend: "up" "same" "down" 중 하나"""
 
-    result = ask_claude_json(prompt, max_tokens=512)
+    result = ask_gemini_json(prompt)
     if not isinstance(result, list):
         raise ValueError("키워드 추출 응답 형식이 올바르지 않습니다.")
     return result
@@ -537,7 +555,6 @@ PERIOD = raw_data.get("period", "")
 DATA = {k: v for k, v in raw_data.items() if k != "period"}
 STORES = load_store_profiles()
 
-# 카테고리 없을 때 기본 구조 보정
 if not DATA:
     DATA = {
         "골프 브랜드": [],
@@ -706,7 +723,7 @@ if st.session_state.page == "news":
                 st.warning("뉴스 수집 결과가 없습니다. 잠시 후 다시 시도해주세요.")
             else:
                 try:
-                    with st.spinner(f"{len(raw_items)}건 AI 분석 중..."):
+                    with st.spinner(f"{len(raw_items)}건 Gemini 분석 중..."):
                         analyzed = classify_and_analyze_crawled(raw_items)
 
                     today = datetime.now().strftime("%m.%d")
@@ -864,7 +881,7 @@ if st.session_state.page == "news":
         with b1:
             if st.button("✦ 재분석" if ai else "✦ AI 분석", key=f"ai_{card['id']}", use_container_width=True):
                 try:
-                    with st.spinner("Claude 분석 중..."):
+                    with st.spinner("Gemini 분석 중..."):
                         result = analyze_news_card(
                             card["title"],
                             f"{card.get('summary', '')} {card.get('oneLine', '')}",
