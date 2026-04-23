@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-MODEL          = "gemini-2.0-flash"
+MODEL          = "gemini-1.5-flash-latest"
 NEWS_FILE      = Path("weekly_news.json")
 STORE_FILE     = Path("store_profiles.xlsx")
 CATEGORY_ICON  = {"골프 브랜드": "🏌️", "골프 경기": "🏆", "골프장 현황": "⛳", "기타 이슈": "📰"}
@@ -154,6 +154,15 @@ def get_client():
     return _make_client(api_key)
 
 
+def _call_api(prompt: str) -> str:
+    try:
+        resp = get_client().models.generate_content(model=MODEL, contents=prompt)
+        return resp.text
+    except Exception as e:
+        st.error(f"AI API 오류: {e}")
+        st.stop()
+
+
 def _parse_json(text: str):
     text = text.strip()
     if text.startswith("```"):
@@ -183,8 +192,7 @@ def analyze_news_card(title: str, raw_text: str, category: str) -> dict:
 }}
 
 priority 기준: HIGH=즉각 매출·발주 영향 / MID=중기 영향 / LOW=참고용"""
-    resp = get_client().models.generate_content(model=MODEL, contents=prompt)
-    return _parse_json(resp.text)
+    return _parse_json(_call_api(prompt))
 
 
 def classify_and_analyze_crawled(items: list[dict]) -> dict:
@@ -213,8 +221,7 @@ def classify_and_analyze_crawled(items: list[dict]) -> dict:
     "actions": ["액션1", "액션2"]
   }}
 ]"""
-    resp = get_client().models.generate_content(model=MODEL, contents=prompt)
-    return _parse_json(resp.text)
+    return _parse_json(_call_api(prompt))
 
 
 def generate_store_insight(store: dict, news_items: list) -> list:
@@ -247,8 +254,7 @@ def generate_store_insight(store: dict, news_items: list) -> list:
 ]
 
 작성 원칙: 점포 특성 반영 / 뉴스 → 실행 연결 / 실현 가능한 백화점 MD 행사 수준"""
-    resp = get_client().models.generate_content(model=MODEL, contents=prompt)
-    results = _parse_json(resp.text)
+    results = _parse_json(_call_api(prompt))
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
     return results[:3]
 
@@ -267,8 +273,7 @@ def extract_weekly_keywords(all_news: list) -> list:
 [{{"keyword": "키워드", "count": 3, "trend": "up"}}, ...]
 
 count: 1~5 정수 / trend: "up" "same" "down" 중 하나"""
-    resp = get_client().models.generate_content(model=MODEL, contents=prompt)
-    return _parse_json(resp.text)
+    return _parse_json(_call_api(prompt))
 
 
 # ══════════════════════════════════════════════════════════════
