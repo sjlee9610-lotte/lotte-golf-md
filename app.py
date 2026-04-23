@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-MODEL          = "gemini-1.5-flash-latest"
+MODEL          = "gemini-1.5-flash"
 NEWS_FILE      = Path("weekly_news.json")
 STORE_FILE     = Path("store_profiles.xlsx")
 CATEGORY_ICON  = {"골프 브랜드": "🏌️", "골프 경기": "🏆", "골프장 현황": "⛳", "기타 이슈": "📰"}
