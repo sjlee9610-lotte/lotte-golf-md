@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
+import google.generativeai as genai
 import pandas as pd
 import requests
 import streamlit as st
@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-MODEL          = "claude-opus-4-6"
+MODEL          = "gemini-1.5-flash"
 NEWS_FILE      = Path("weekly_news.json")
 STORE_FILE     = Path("store_profiles.xlsx")
 CATEGORY_ICON  = {"골프 브랜드": "🏌️", "골프 경기": "🏆", "골프장 현황": "⛳", "기타 이슈": "📰"}
@@ -147,7 +147,8 @@ def get_client():
     api_key = get_api_key()
     if not api_key:
         return None
-    return anthropic.Anthropic(api_key=api_key)
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(MODEL)
 
 
 def _parse_json(text: str):
@@ -179,11 +180,8 @@ def analyze_news_card(title: str, raw_text: str, category: str) -> dict:
 }}
 
 priority 기준: HIGH=즉각 매출·발주 영향 / MID=중기 영향 / LOW=참고용"""
-    resp = get_client().messages.create(
-        model=MODEL, max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return _parse_json(resp.content[0].text)
+    resp = get_client().generate_content(prompt)
+    return _parse_json(resp.text)
 
 
 def classify_and_analyze_crawled(items: list[dict]) -> dict:
@@ -212,11 +210,8 @@ def classify_and_analyze_crawled(items: list[dict]) -> dict:
     "actions": ["액션1", "액션2"]
   }}
 ]"""
-    resp = get_client().messages.create(
-        model=MODEL, max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return _parse_json(resp.content[0].text)
+    resp = get_client().generate_content(prompt)
+    return _parse_json(resp.text)
 
 
 def generate_store_insight(store: dict, news_items: list) -> list:
@@ -249,11 +244,8 @@ def generate_store_insight(store: dict, news_items: list) -> list:
 ]
 
 작성 원칙: 점포 특성 반영 / 뉴스 → 실행 연결 / 실현 가능한 백화점 MD 행사 수준"""
-    resp = get_client().messages.create(
-        model=MODEL, max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    results = _parse_json(resp.content[0].text)
+    resp = get_client().generate_content(prompt)
+    results = _parse_json(resp.text)
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
     return results[:3]
 
@@ -272,11 +264,8 @@ def extract_weekly_keywords(all_news: list) -> list:
 [{{"keyword": "키워드", "count": 3, "trend": "up"}}, ...]
 
 count: 1~5 정수 / trend: "up" "same" "down" 중 하나"""
-    resp = get_client().messages.create(
-        model=MODEL, max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return _parse_json(resp.content[0].text)
+    resp = get_client().generate_content(prompt)
+    return _parse_json(resp.text)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -368,15 +357,15 @@ if not get_api_key():
             label_visibility="collapsed",
         )
         if st.button("시작하기", use_container_width=True, type="primary"):
-            if key_input.startswith("sk-ant-"):
+            if key_input.startswith("AIza"):
                 st.session_state.api_key = key_input
                 st.rerun()
             else:
-                st.error("올바른 API 키 형식이 아닙니다. sk-ant- 로 시작해야 합니다.")
+                st.error("올바른 API 키 형식이 아닙니다. AIza 로 시작해야 합니다.")
         st.markdown(
             '<div style="text-align:center;margin-top:12px;font-size:13px;color:#9ca3af;">'
-            'API 키는 <a href="https://console.anthropic.com/settings/keys" target="_blank">'
-            'console.anthropic.com</a> 에서 발급</div>',
+            'API 키는 <a href="https://aistudio.google.com/app/apikey" target="_blank">'
+            'aistudio.google.com</a> 에서 무료 발급</div>',
             unsafe_allow_html=True,
         )
     st.stop()
