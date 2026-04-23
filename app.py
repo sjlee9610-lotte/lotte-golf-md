@@ -133,11 +133,14 @@ def crawl_all_news() -> list[dict]:
 # ══════════════════════════════════════════════════════════════
 
 def get_client():
-    # Streamlit Cloud 시크릿 → 로컬 환경변수 순으로 키 탐색
+    api_key = None
     try:
         api_key = st.secrets["ANTHROPIC_API_KEY"]
     except (KeyError, FileNotFoundError):
         api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        st.error("❌ ANTHROPIC_API_KEY가 설정되지 않았습니다.\nStreamlit Cloud → Manage app → Secrets 에 키를 추가해 주세요.")
+        st.stop()
     return anthropic.Anthropic(api_key=api_key)
 
 
