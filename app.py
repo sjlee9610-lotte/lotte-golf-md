@@ -1,10 +1,31 @@
+"""
+app.py — 롯데 석주 주간 골프 MD 뉴스 알림 (완전 통합판)
+
+포함 기능:
+  - 뉴스 데이터: weekly_news.json 에서 로드 (코드 분리)
+  - 점포 데이터: store_profiles.xlsx 에서 로드 (엑셀 연동)
+  - Claude API: 뉴스 AI 분석 / 점포 인사이트 자동생성 / 키워드 추출
+  - 뉴스 수집 버튼: 네이버 골프 뉴스 크롤링 → AI 분석 → 저장
+  - 채택 리포트: 마크다운 다운로드
+  - 전체 점포 비교 테이블 탭
+  - 키워드 트렌드 배지
+  - expanded_id 버그 수정 (탭 이동 시 초기화)
+
+실행 전 준비:
+  pip install streamlit anthropic openpyxl requests beautifulsoup4
+  export ANTHROPIC_API_KEY="sk-ant-..."
+  python create_sample_excel.py  (최초 1회)
+  streamlit run app.py
+"""
+
 import json
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import anthropic
 import pandas as pd
 import requests
 import streamlit as st
@@ -19,15 +40,7 @@ st.set_page_config(
     layout="wide",
 )
 
-GEMINI_BASE    = "https://generativelanguage.googleapis.com/v1beta"
-PREFERRED_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-pro",
-    "gemini-pro",
-]
+MODEL          = "claude-opus-4-6"
 NEWS_FILE      = Path("weekly_news.json")
 STORE_FILE     = Path("store_profiles.xlsx")
 CATEGORY_ICON  = {"골프 브랜드": "🏌️", "골프 경기": "🏆", "골프장 현황": "⛳", "기타 이슈": "📰"}
@@ -53,6 +66,7 @@ CRAWL_QUERIES = [
 
 @st.cache_data(ttl=60)
 def load_news() -> dict:
+    """weekly_news.json 로드. 없으면 빈 구조 반환."""
     if NEWS_FILE.exists():
         with open(NEWS_FILE, encoding="utf-8") as f:
             return json.load(f)
@@ -61,6 +75,7 @@ def load_news() -> dict:
 
 @st.cache_data(ttl=60)
 def load_store_profiles() -> list[dict]:
+    """store_profiles.xlsx 로드. 없으면 하드코딩 기본값 사용."""
     if STORE_FILE.exists():
         df = pd.read_excel(STORE_FILE)
         stores = []
@@ -75,6 +90,7 @@ def load_store_profiles() -> list[dict]:
                 "trait":       str(row.get("점포특성", "")),
             })
         return stores
+    # 엑셀 없을 경우 기본값
     return [
         {"name": "잠실점",   "annualSales": "350억", "customers": "20,000명", "avgTicket": "80만원", "vipRatio": 45, "avgAge": 56, "trait": "롯데월드몰 이용가능"},
         {"name": "본점",     "annualSales": "250억", "customers": "15,000명", "avgTicket": "90만원", "vipRatio": 50, "avgAge": 47, "trait": "외국인 고객 많음"},
@@ -90,6 +106,7 @@ def load_store_profiles() -> list[dict]:
 
 
 def save_news(data: dict):
+    """뉴스 데이터를 weekly_news.json에 저장."""
     with open(NEWS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     load_news.clear()
@@ -100,6 +117,7 @@ def save_news(data: dict):
 # ══════════════════════════════════════════════════════════════
 
 def crawl_naver_news(query: str, max_items: int = 3) -> list[dict]:
+    """네이버 뉴스 검색 결과 크롤링."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     url = f"https://search.naver.com/search.naver?where=news&query={requests.utils.quote(query)}&sort=1"
     try:
@@ -124,6 +142,7 @@ def crawl_naver_news(query: str, max_items: int = 3) -> list[dict]:
 
 
 def crawl_all_news() -> list[dict]:
+    """전체 쿼리 크롤링 후 중복 제거."""
     all_items, seen_titles = [], set()
     for query in CRAWL_QUERIES:
         for item in crawl_naver_news(query, max_items=3):
@@ -136,74 +155,11 @@ def crawl_all_news() -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════
-# Gemini API (REST 직접 호출)
+# Claude API
 # ══════════════════════════════════════════════════════════════
 
-def get_api_key() -> str:
-    try:
-        return st.secrets["ANTHROPIC_API_KEY"]
-    except (KeyError, FileNotFoundError):
-        pass
-    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if env_key:
-        return env_key
-    return st.session_state.get("api_key", "")
-
-
-def _detect_model(api_key: str) -> str:
-    try:
-        r = requests.get(f"{GEMINI_BASE}/models?key={api_key}", timeout=10)
-        if r.status_code == 200:
-            available = {
-                m["name"].replace("models/", "")
-                for m in r.json().get("models", [])
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-            }
-            for m in PREFERRED_MODELS:
-                if m in available:
-                    return m
-    except Exception:
-        pass
-    return "gemini-1.5-flash"
-
-
-def _call_api(prompt: str) -> str:
-    api_key = get_api_key()
-    if not st.session_state.get("gemini_model"):
-        with st.spinner("사용 가능한 AI 모델 확인 중..."):
-            st.session_state.gemini_model = _detect_model(api_key)
-
-    failed: set = st.session_state.get("gemini_failed", set())
-    candidates = [st.session_state.gemini_model] + [m for m in PREFERRED_MODELS if m != st.session_state.gemini_model]
-
-    for model in candidates:
-        if model in failed:
-            continue
-        try:
-            resp = requests.post(
-                f"{GEMINI_BASE}/models/{model}:generateContent?key={api_key}",
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.3}},
-                timeout=60,
-            )
-            if resp.status_code == 429 and "limit: 0" in resp.text:
-                failed.add(model)
-                st.session_state.gemini_failed = failed
-                st.session_state.gemini_model = ""
-                continue
-            resp.raise_for_status()
-            st.session_state.gemini_model = model
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        except requests.HTTPError:
-            err = resp.json().get("error", {}).get("message", resp.text[:300])
-            st.error(f"AI API 오류 ({model}): {resp.status_code} — {err}")
-            st.stop()
-        except Exception as e:
-            st.error(f"AI API 오류: {e}")
-            st.stop()
-
-    st.error("이 API 키로 사용 가능한 무료 모델이 없습니다.\nhttps://aistudio.google.com/app/apikey 에서 새 키를 발급받아 주세요.")
-    st.stop()
+def get_client():
+    return anthropic.Anthropic()
 
 
 def _parse_json(text: str):
@@ -235,10 +191,15 @@ def analyze_news_card(title: str, raw_text: str, category: str) -> dict:
 }}
 
 priority 기준: HIGH=즉각 매출·발주 영향 / MID=중기 영향 / LOW=참고용"""
-    return _parse_json(_call_api(prompt))
+    resp = get_client().messages.create(
+        model=MODEL, max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return _parse_json(resp.content[0].text)
 
 
 def classify_and_analyze_crawled(items: list[dict]) -> dict:
+    """크롤링된 뉴스 목록을 카테고리 분류 + 개별 분석."""
     batch_text = "\n".join(
         f"{i+1}. 제목: {it['title']}\n   본문: {it['desc'][:200]}"
         for i, it in enumerate(items)
@@ -262,9 +223,14 @@ def classify_and_analyze_crawled(items: list[dict]) -> dict:
     "summary": "2~3문장 요약. 수치·브랜드명 포함.",
     "insight": "MD 관점 함의 1~2문장.",
     "actions": ["액션1", "액션2"]
-  }}
+  }},
+  ...
 ]"""
-    return _parse_json(_call_api(prompt))
+    resp = get_client().messages.create(
+        model=MODEL, max_tokens=3000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return _parse_json(resp.content[0].text)
 
 
 def generate_store_insight(store: dict, news_items: list) -> list:
@@ -297,7 +263,11 @@ def generate_store_insight(store: dict, news_items: list) -> list:
 ]
 
 작성 원칙: 점포 특성 반영 / 뉴스 → 실행 연결 / 실현 가능한 백화점 MD 행사 수준"""
-    results = _parse_json(_call_api(prompt))
+    resp = get_client().messages.create(
+        model=MODEL, max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    results = _parse_json(resp.content[0].text)
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
     return results[:3]
 
@@ -316,28 +286,41 @@ def extract_weekly_keywords(all_news: list) -> list:
 [{{"keyword": "키워드", "count": 3, "trend": "up"}}, ...]
 
 count: 1~5 정수 / trend: "up" "same" "down" 중 하나"""
-    return _parse_json(_call_api(prompt))
+    resp = get_client().messages.create(
+        model=MODEL, max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return _parse_json(resp.content[0].text)
 
 
 # ══════════════════════════════════════════════════════════════
-# 채택 리포트
+# 채택 리포트 생성
 # ══════════════════════════════════════════════════════════════
 
 def build_report_markdown(selected_cards: list, period: str) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
-        "# 롯데 석주 주간 골프 MD 리포트",
+        f"# 롯데 석주 주간 골프 MD 리포트",
         f"**기간**: {period}  |  **생성일**: {now}  |  **채택 뉴스**: {len(selected_cards)}건",
-        "", "---", "",
+        "",
+        "---",
+        "",
     ]
     for i, card in enumerate(selected_cards, 1):
         lines += [
             f"## {i}. {card['title']}",
             f"**날짜**: {card['date']}  |  **출처**: {card['source']}  |  **우선순위**: {card['priority']}",
-            "", f"**핵심 요약**: {card['oneLine']}", "",
-            card['summary'], "",
-            f"**MD 인사이트**: {card['insight']}", "",
-            f"**실행 액션**: {' / '.join(card['actions'])}", "", "---", "",
+            "",
+            f"**핵심 요약**: {card['oneLine']}",
+            "",
+            card['summary'],
+            "",
+            f"**MD 인사이트**: {card['insight']}",
+            "",
+            f"**실행 액션**: {' / '.join(card['actions'])}",
+            "",
+            "---",
+            "",
         ]
     return "\n".join(lines)
 
@@ -371,9 +354,6 @@ def build_store_insights_fallback(store, selected_cards, data) -> list:
 defaults = {
     "page": "news",
     "category": "골프 브랜드",
-    "api_key": "",
-    "gemini_model": "",
-    "gemini_failed": set(),
     "selected_cards": [],
     "expanded_id": None,
     "ai_results": {},
@@ -385,49 +365,11 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── API 키 입력 화면 ───────────────────────────────────────────
-if not get_api_key():
-    st.markdown("""
-    <div style="max-width:480px;margin:80px auto;padding:40px;background:white;
-                border-radius:24px;box-shadow:0 4px 32px rgba(6,78,59,.12);
-                border:1px solid #d1fae5;text-align:center;">
-        <div style="font-size:48px;margin-bottom:16px;">⛳</div>
-        <div style="font-size:22px;font-weight:800;color:#064e3b;margin-bottom:8px;">
-            롯데 석주 골프 MD 뉴스
-        </div>
-        <div style="font-size:15px;color:#6b7280;margin-bottom:28px;">
-            시작하려면 Anthropic API 키를 입력해 주세요.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col = st.columns([1, 2, 1])[1]
-    with col:
-        key_input = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            placeholder="sk-ant-api03-...",
-            label_visibility="collapsed",
-        )
-        if st.button("시작하기", use_container_width=True, type="primary"):
-            if key_input.startswith("AIza"):
-                st.session_state.api_key = key_input
-                st.rerun()
-            else:
-                st.error("올바른 API 키 형식이 아닙니다. AIza 로 시작해야 합니다.")
-        st.markdown(
-            '<div style="text-align:center;margin-top:12px;font-size:13px;color:#9ca3af;">'
-            'API 키는 <a href="https://aistudio.google.com/app/apikey" target="_blank">'
-            'aistudio.google.com</a> 에서 무료 발급</div>',
-            unsafe_allow_html=True,
-        )
-    st.stop()
-
 # ── 데이터 로드 ────────────────────────────────────────────────
-raw_data = load_news()
-PERIOD   = raw_data.get("period", "")
-DATA     = {k: v for k, v in raw_data.items() if k != "period"}
-STORES   = load_store_profiles()
+raw_data   = load_news()
+PERIOD     = raw_data.get("period", "")
+DATA       = {k: v for k, v in raw_data.items() if k != "period"}
+STORES     = load_store_profiles()
 
 # ══════════════════════════════════════════════════════════════
 # 전역 스타일
@@ -566,6 +508,7 @@ with nav3:
 
 if st.session_state.page == "news":
 
+    # ── 뉴스 수집 버튼 + 키워드 추출 ──────────────────────────
     top_c1, top_c2, top_c3, top_c4 = st.columns([2, 2, 2, 2])
 
     with top_c1:
@@ -589,16 +532,16 @@ if st.session_state.page == "news":
                     if cat not in new_data:
                         cat = "기타 이슈"
                     new_data[cat].append({
-                        "id":        f"crawled-{i}",
-                        "date":      today,
-                        "source":    src["source"],
-                        "title":     src["title"],
-                        "priority":  result.get("priority", "MID"),
-                        "oneLine":   result.get("oneLine", ""),
-                        "summary":   result.get("summary", src["desc"][:150]),
+                        "id":       f"crawled-{i}",
+                        "date":     today,
+                        "source":   src["source"],
+                        "title":    src["title"],
+                        "priority": result.get("priority", "MID"),
+                        "oneLine":  result.get("oneLine", ""),
+                        "summary":  result.get("summary", src["desc"][:150]),
                         "headlines": [{"title": src["title"], "url": src["url"]}],
-                        "insight":   result.get("insight", ""),
-                        "actions":   result.get("actions", []),
+                        "insight":  result.get("insight", ""),
+                        "actions":  result.get("actions", []),
                     })
 
                 save_news(new_data)
@@ -663,8 +606,8 @@ if st.session_state.page == "news":
             icon  = CATEGORY_ICON.get(cat, "")
             count = len(DATA.get(cat, []))
             if st.button(f"{icon} {cat} ({count})", use_container_width=True, key=f"cat_{cat}"):
-                st.session_state.category    = cat
-                st.session_state.expanded_id = None
+                st.session_state.category   = cat
+                st.session_state.expanded_id = None   # ← 버그 수정: 탭 변경 시 초기화
             st.markdown(
                 '<div class="active-bar"></div>' if st.session_state.category == cat else '<div class="inactive-bar"></div>',
                 unsafe_allow_html=True,
@@ -680,11 +623,11 @@ if st.session_state.page == "news":
 
     for card in cards:
         ai = st.session_state.ai_results.get(card["id"])
-        dp = ai["priority"] if ai else card["priority"]
-        dl = ai["oneLine"]  if ai else card["oneLine"]
-        ds = ai["summary"]  if ai else card["summary"]
-        di = ai["insight"]  if ai else card["insight"]
-        da = ai["actions"]  if ai else card["actions"]
+        dp  = ai["priority"] if ai else card["priority"]
+        dl  = ai["oneLine"]  if ai else card["oneLine"]
+        ds  = ai["summary"]  if ai else card["summary"]
+        di  = ai["insight"]  if ai else card["insight"]
+        da  = ai["actions"]  if ai else card["actions"]
 
         border_color = PRIORITY_COLOR.get(dp, "#94a3b8")
         ai_badge     = '<span class="ai-badge-inline">✦ AI</span>' if ai else ""
@@ -842,16 +785,13 @@ elif st.session_state.page == "compare":
 
     st.markdown('<div style="font-size:20px;font-weight:800;color:#064e3b;margin-bottom:16px;">전체 점포 비교</div>', unsafe_allow_html=True)
 
-    sort_options = {
-        "연간 매출 ↓": ("annualSales_raw", True),
-        "객단가 ↓":    ("avgTicket_raw", True),
-        "우수고객 비율 ↓": ("vipRatio", True),
-        "평균 연령 ↓": ("avgAge", True),
-        "평균 연령 ↑": ("avgAge", False),
-    }
+    sort_options = {"연간 매출 ↓": ("annualSales_raw", True), "객단가 ↓": ("avgTicket_raw", True),
+                    "우수고객 비율 ↓": ("vipRatio", True), "평균 연령 ↓": ("avgAge", True),
+                    "평균 연령 ↑": ("avgAge", False)}
     sort_key = st.selectbox("정렬 기준", list(sort_options.keys()), index=0, key="sort_compare")
     sort_col, sort_desc = sort_options[sort_key]
 
+    # 정렬용 수치 추가
     stores_for_sort = []
     for s in STORES:
         s2 = dict(s)
@@ -860,6 +800,7 @@ elif st.session_state.page == "compare":
         stores_for_sort.append(s2)
 
     stores_sorted = sorted(stores_for_sort, key=lambda x: x.get(sort_col, 0), reverse=sort_desc)
+
     max_sales  = max(s["annualSales_raw"] for s in stores_sorted) or 1
     max_ticket = max(s["avgTicket_raw"]   for s in stores_sorted) or 1
     max_vip    = max(s["vipRatio"]        for s in stores_sorted) or 1
@@ -869,14 +810,30 @@ elif st.session_state.page == "compare":
         sales_pct  = s["annualSales_raw"] / max_sales  * 100
         ticket_pct = s["avgTicket_raw"]   / max_ticket * 100
         vip_pct    = s["vipRatio"]        / max_vip    * 100
+
         rows_html += f"""
 <tr>
   <td style="font-weight:700;color:#064e3b;">{rank}</td>
   <td style="font-weight:800;color:#064e3b;">{s["name"]}</td>
-  <td><div class="bar-cell"><div class="mini-bar-bg"><div class="mini-bar-fill" style="width:{sales_pct:.0f}%;"></div></div>{s["annualSales"]}</div></td>
+  <td>
+    <div class="bar-cell">
+      <div class="mini-bar-bg"><div class="mini-bar-fill" style="width:{sales_pct:.0f}%;"></div></div>
+      {s["annualSales"]}
+    </div>
+  </td>
   <td>{s["customers"]}</td>
-  <td><div class="bar-cell"><div class="mini-bar-bg"><div class="mini-bar-fill" style="width:{ticket_pct:.0f}%;background:linear-gradient(90deg,#d97706,#fbbf24);"></div></div>{s["avgTicket"]}</div></td>
-  <td><div class="bar-cell"><div class="mini-bar-bg"><div class="mini-bar-fill" style="width:{vip_pct:.0f}%;background:linear-gradient(90deg,#7c3aed,#a78bfa);"></div></div>{s["vipRatio"]}%</div></td>
+  <td>
+    <div class="bar-cell">
+      <div class="mini-bar-bg"><div class="mini-bar-fill" style="width:{ticket_pct:.0f}%;background:linear-gradient(90deg,#d97706,#fbbf24);"></div></div>
+      {s["avgTicket"]}
+    </div>
+  </td>
+  <td>
+    <div class="bar-cell">
+      <div class="mini-bar-bg"><div class="mini-bar-fill" style="width:{vip_pct:.0f}%;background:linear-gradient(90deg,#7c3aed,#a78bfa);"></div></div>
+      {s["vipRatio"]}%
+    </div>
+  </td>
   <td>{s["avgAge"]}세</td>
   <td><span style="font-size:13px;background:#f0fdf4;border:1px solid #a7f3d0;border-radius:6px;padding:3px 9px;color:#065f46;">{s["trait"]}</span></td>
 </tr>"""
@@ -884,11 +841,16 @@ elif st.session_state.page == "compare":
     st.markdown(f"""
 <table class="compare-table">
   <thead>
-    <tr><th>#</th><th>점포</th><th>연간 매출</th><th>구매고객수</th><th>객단가</th><th>우수고객 비율</th><th>평균 연령</th><th>특성</th></tr>
+    <tr>
+      <th>#</th><th>점포</th><th>연간 매출</th><th>구매고객수</th>
+      <th>객단가</th><th>우수고객 비율</th><th>평균 연령</th><th>특성</th>
+    </tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
 """, unsafe_allow_html=True)
+
+    st.markdown('<div style="margin-top:12px;font-size:13px;color:#94a3b8;">💡 점포명을 클릭하면 점포 인사이트 페이지로 이동합니다.</div>', unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns(3)
     with col1:
