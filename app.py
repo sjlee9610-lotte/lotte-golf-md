@@ -143,11 +143,15 @@ def get_api_key() -> str:
     return st.session_state.get("api_key", "")
 
 
+@st.cache_resource
+def _make_client(api_key: str):
+    return genai.Client(api_key=api_key)
+
 def get_client():
     api_key = get_api_key()
     if not api_key:
         return None
-    return genai.Client(api_key=api_key)
+    return _make_client(api_key)
 
 
 def _parse_json(text: str):
