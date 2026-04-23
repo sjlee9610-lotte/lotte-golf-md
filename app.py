@@ -132,15 +132,21 @@ def crawl_all_news() -> list[dict]:
 # Claude API
 # ══════════════════════════════════════════════════════════════
 
-def get_client():
-    api_key = None
+def get_api_key() -> str:
     try:
-        api_key = st.secrets["ANTHROPIC_API_KEY"]
+        return st.secrets["ANTHROPIC_API_KEY"]
     except (KeyError, FileNotFoundError):
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        pass
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if env_key:
+        return env_key
+    return st.session_state.get("api_key", "")
+
+
+def get_client():
+    api_key = get_api_key()
     if not api_key:
-        st.error("❌ ANTHROPIC_API_KEY가 설정되지 않았습니다.\nStreamlit Cloud → Manage app → Secrets 에 키를 추가해 주세요.")
-        st.stop()
+        return None
     return anthropic.Anthropic(api_key=api_key)
 
 
@@ -325,6 +331,7 @@ def build_store_insights_fallback(store, selected_cards, data) -> list:
 defaults = {
     "page": "news",
     "category": "골프 브랜드",
+    "api_key": "",
     "selected_cards": [],
     "expanded_id": None,
     "ai_results": {},
@@ -335,6 +342,44 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ── API 키 입력 화면 ───────────────────────────────────────────
+if not get_api_key():
+    st.markdown("""
+    <div style="max-width:480px;margin:80px auto;padding:40px;background:white;
+                border-radius:24px;box-shadow:0 4px 32px rgba(6,78,59,.12);
+                border:1px solid #d1fae5;text-align:center;">
+        <div style="font-size:48px;margin-bottom:16px;">⛳</div>
+        <div style="font-size:22px;font-weight:800;color:#064e3b;margin-bottom:8px;">
+            롯데 석주 골프 MD 뉴스
+        </div>
+        <div style="font-size:15px;color:#6b7280;margin-bottom:28px;">
+            시작하려면 Anthropic API 키를 입력해 주세요.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col = st.columns([1, 2, 1])[1]
+    with col:
+        key_input = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            placeholder="sk-ant-api03-...",
+            label_visibility="collapsed",
+        )
+        if st.button("시작하기", use_container_width=True, type="primary"):
+            if key_input.startswith("sk-ant-"):
+                st.session_state.api_key = key_input
+                st.rerun()
+            else:
+                st.error("올바른 API 키 형식이 아닙니다. sk-ant- 로 시작해야 합니다.")
+        st.markdown(
+            '<div style="text-align:center;margin-top:12px;font-size:13px;color:#9ca3af;">'
+            'API 키는 <a href="https://console.anthropic.com/settings/keys" target="_blank">'
+            'console.anthropic.com</a> 에서 발급</div>',
+            unsafe_allow_html=True,
+        )
+    st.stop()
 
 # ── 데이터 로드 ────────────────────────────────────────────────
 raw_data = load_news()
