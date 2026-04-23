@@ -5,7 +5,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from google import genai
 import pandas as pd
 import requests
 import streamlit as st
@@ -20,7 +19,7 @@ st.set_page_config(
     layout="wide",
 )
 
-MODEL          = "gemini-1.5-flash"
+GEMINI_URL     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 NEWS_FILE      = Path("weekly_news.json")
 STORE_FILE     = Path("store_profiles.xlsx")
 CATEGORY_ICON  = {"골프 브랜드": "🏌️", "골프 경기": "🏆", "골프장 현황": "⛳", "기타 이슈": "📰"}
@@ -129,7 +128,7 @@ def crawl_all_news() -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════
-# Claude API
+# Gemini API (REST 직접 호출)
 # ══════════════════════════════════════════════════════════════
 
 def get_api_key() -> str:
@@ -143,21 +142,20 @@ def get_api_key() -> str:
     return st.session_state.get("api_key", "")
 
 
-@st.cache_resource
-def _make_client(api_key: str):
-    return genai.Client(api_key=api_key)
-
-def get_client():
-    api_key = get_api_key()
-    if not api_key:
-        return None
-    return _make_client(api_key)
-
-
 def _call_api(prompt: str) -> str:
+    api_key = get_api_key()
     try:
-        resp = get_client().models.generate_content(model=MODEL, contents=prompt)
-        return resp.text
+        resp = requests.post(
+            f"{GEMINI_URL}?key={api_key}",
+            json={"contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.3}},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except requests.HTTPError:
+        st.error(f"AI API 오류: {resp.status_code} — {resp.json().get('error', {}).get('message', resp.text[:200])}")
+        st.stop()
     except Exception as e:
         st.error(f"AI API 오류: {e}")
         st.stop()
