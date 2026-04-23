@@ -172,23 +172,38 @@ def _call_api(prompt: str) -> str:
     if not st.session_state.get("gemini_model"):
         with st.spinner("사용 가능한 AI 모델 확인 중..."):
             st.session_state.gemini_model = _detect_model(api_key)
-    model = st.session_state.gemini_model
-    try:
-        resp = requests.post(
-            f"{GEMINI_BASE}/models/{model}:generateContent?key={api_key}",
-            json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"temperature": 0.3}},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except requests.HTTPError:
-        err = resp.json().get("error", {}).get("message", resp.text[:300])
-        st.error(f"AI API 오류 ({model}): {resp.status_code} — {err}")
-        st.stop()
-    except Exception as e:
-        st.error(f"AI API 오류: {e}")
-        st.stop()
+
+    failed: set = st.session_state.get("gemini_failed", set())
+    candidates = [st.session_state.gemini_model] + [m for m in PREFERRED_MODELS if m != st.session_state.gemini_model]
+
+    for model in candidates:
+        if model in failed:
+            continue
+        try:
+            resp = requests.post(
+                f"{GEMINI_BASE}/models/{model}:generateContent?key={api_key}",
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": 0.3}},
+                timeout=60,
+            )
+            if resp.status_code == 429 and "limit: 0" in resp.text:
+                failed.add(model)
+                st.session_state.gemini_failed = failed
+                st.session_state.gemini_model = ""
+                continue
+            resp.raise_for_status()
+            st.session_state.gemini_model = model
+            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except requests.HTTPError:
+            err = resp.json().get("error", {}).get("message", resp.text[:300])
+            st.error(f"AI API 오류 ({model}): {resp.status_code} — {err}")
+            st.stop()
+        except Exception as e:
+            st.error(f"AI API 오류: {e}")
+            st.stop()
+
+    st.error("이 API 키로 사용 가능한 무료 모델이 없습니다.\nhttps://aistudio.google.com/app/apikey 에서 새 키를 발급받아 주세요.")
+    st.stop()
 
 
 def _parse_json(text: str):
@@ -358,6 +373,7 @@ defaults = {
     "category": "골프 브랜드",
     "api_key": "",
     "gemini_model": "",
+    "gemini_failed": set(),
     "selected_cards": [],
     "expanded_id": None,
     "ai_results": {},
