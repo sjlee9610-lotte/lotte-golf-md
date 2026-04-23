@@ -19,7 +19,15 @@ st.set_page_config(
     layout="wide",
 )
 
-GEMINI_URL     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_BASE    = "https://generativelanguage.googleapis.com/v1beta"
+PREFERRED_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-pro",
+    "gemini-pro",
+]
 NEWS_FILE      = Path("weekly_news.json")
 STORE_FILE     = Path("store_profiles.xlsx")
 CATEGORY_ICON  = {"골프 브랜드": "🏌️", "골프 경기": "🏆", "골프장 현황": "⛳", "기타 이슈": "📰"}
@@ -142,11 +150,32 @@ def get_api_key() -> str:
     return st.session_state.get("api_key", "")
 
 
+def _detect_model(api_key: str) -> str:
+    try:
+        r = requests.get(f"{GEMINI_BASE}/models?key={api_key}", timeout=10)
+        if r.status_code == 200:
+            available = {
+                m["name"].replace("models/", "")
+                for m in r.json().get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            }
+            for m in PREFERRED_MODELS:
+                if m in available:
+                    return m
+    except Exception:
+        pass
+    return "gemini-1.5-flash"
+
+
 def _call_api(prompt: str) -> str:
     api_key = get_api_key()
+    if not st.session_state.get("gemini_model"):
+        with st.spinner("사용 가능한 AI 모델 확인 중..."):
+            st.session_state.gemini_model = _detect_model(api_key)
+    model = st.session_state.gemini_model
     try:
         resp = requests.post(
-            f"{GEMINI_URL}?key={api_key}",
+            f"{GEMINI_BASE}/models/{model}:generateContent?key={api_key}",
             json={"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": 0.3}},
             timeout=60,
@@ -154,7 +183,8 @@ def _call_api(prompt: str) -> str:
         resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except requests.HTTPError:
-        st.error(f"AI API 오류: {resp.status_code} — {resp.json().get('error', {}).get('message', resp.text[:200])}")
+        err = resp.json().get("error", {}).get("message", resp.text[:300])
+        st.error(f"AI API 오류 ({model}): {resp.status_code} — {err}")
         st.stop()
     except Exception as e:
         st.error(f"AI API 오류: {e}")
@@ -327,6 +357,7 @@ defaults = {
     "page": "news",
     "category": "골프 브랜드",
     "api_key": "",
+    "gemini_model": "",
     "selected_cards": [],
     "expanded_id": None,
     "ai_results": {},
